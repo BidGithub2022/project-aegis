@@ -1,0 +1,9 @@
+docker build --platform=linux/amd64 -t aegis-inference-engine:v3 .
+
+# Log in to registry
+docker login -u kubeadmin -p $(oc whoami -t) $(oc registry info)
+
+docker tag aegis-inference-engine:v3 default-route-openshift-image-registry.apps.rm2.thpm.p1.openshiftapps.com/mailtobidyut-dev/aegis-inference-engine:v3
+docker push default-route-openshift-image-registry.apps.rm2.thpm.p1.openshiftapps.com/mailtobidyut-dev/aegis-inference-engine:v3
+
+

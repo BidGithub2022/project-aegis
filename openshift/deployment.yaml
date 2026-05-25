@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-inference-engine
+  labels:
+    app: aegis-fraud-detector
+spec:
+  replicas: 2 # Scale horizontally to two instances for high availability
+  selector:
+    matchLabels:
+      app: aegis-inference-service
+  template:
+    metadata:
+      labels:
+        app: aegis-inference-service
+    spec:
+      containers:
+      - name: nlp-engine
+        image: aegis-inference-engine:v1 # OpenShift will pull your built image
+        ports:
+        - containerPort: 8000
+        # Resource allocations protect the cluster from CPU spikes during analysis
+        resources:
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+        # Enterprise Liveness and Readiness probes using our FastAPI /healthz endpoint
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8000
+          initialDelaySeconds: 20
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-inference-service
+  labels:
+    app: aegis-fraud-detector
+spec:
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: aegis-inference-service
+  type: ClusterIP # Keeps the microservice safely hidden inside the private cluster network

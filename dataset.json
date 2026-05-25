@@ -1,0 +1,32 @@
+[
+  {
+    "id": 1,
+    "text": "This is the IRS. You have an unpaid tax debt of $4,500. Pay immediately via Zelle or a warrant will be issued for your arrest.",
+    "label": "scam",
+    "strategy": "authority_urgency_fear"
+  },
+  {
+    "id": 2,
+    "text": "Hi Mom, it's me. I lost my phone and I'm using a friend's. I'm stuck at the airport and need $200 for a ticket. Can you send it to this link?",
+    "label": "scam",
+    "strategy": "emotional_impersonation"
+  },
+  {
+    "id": 3,
+    "text": "Hey, are we still meeting for lunch at 12:30 at the deli? Let me know if you're running late.",
+    "label": "safe",
+    "strategy": "casual_social"
+  },
+  {
+    "id": 4,
+    "text": "Your Amazon order #123-456 has shipped! Track your package here: [Real Link]. Thanks for shopping.",
+    "label": "safe",
+    "strategy": "transactional_update"
+  },
+  {
+    "id": 5,
+    "text": "URGENT: Your Netflix account will be suspended. Update your billing info NOW at http://netflix-secure-login.com/payment.",
+    "label": "scam",
+    "strategy": "brand_impersonation_urgency"
+  }
+]
