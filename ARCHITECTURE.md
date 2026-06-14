@@ -2,7 +2,7 @@
 
 Runtime architecture for the **local Docker Compose stack** and WhatsApp integration via Evolution API.
 
-For the longer-term pipeline (Pub/Sub, Beam, BigQuery), see [`flow-diagram`](flow-diagram).
+For the longer-term pipeline (Pub/Sub, Beam, BigQuery), see [`flow-diagram`](flow-diagram). For Python module call flow, see [`MODULES.md`](MODULES.md).
 
 ## Overview
 
