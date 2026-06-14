@@ -1,22 +1,35 @@
 import os
-from typing import Any, List, Optional
+from contextlib import asynccontextmanager
+from typing import Any, List, Optional, Set, Tuple
 
 import httpx
 import spacy
 from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel
 
+import session_store
+
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://evolution-api:8080").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "test-user")
 EVOLUTION_ALERT_NUMBER = os.getenv("EVOLUTION_ALERT_NUMBER", "")
 EVOLUTION_ALERTS_ENABLED = os.getenv("EVOLUTION_ALERTS_ENABLED", "true").lower() in ("1", "true", "yes")
+RISK_ALERT_THRESHOLD = int(os.getenv("RISK_ALERT_THRESHOLD", "8"))
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await session_store.connect()
+    yield
+    await session_store.disconnect()
+
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Project Aegis: Social Engineering Inference Engine",
     description="Enterprise-grade NLP engine for real-time social engineering and scam detection.",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Load the industrial-grade NLP model into memory on startup
@@ -99,10 +112,32 @@ def evolution_message_records(data: Any) -> List[dict]:
     return []
 
 
-def process_inbound_whatsapp_message(record: dict) -> dict:
+def score_message_delta(analysis: dict) -> Tuple[int, Set[str]]:
+    """Points and flags contributed by a single message."""
+    delta = 0
+    flags: Set[str] = set()
+
+    if analysis["urgency_score"] > 0:
+        delta += analysis["urgency_score"] * 2
+        flags.add("URGENCY_DETECTED")
+    if analysis["authority_markers"]:
+        delta += 3
+        flags.add("AUTHORITY_CLAIMED")
+    if analysis["action_requests"]:
+        delta += 5
+        flags.add("FINANCIAL_PIVOT")
+
+    return delta, flags
+
+
+async def process_inbound_whatsapp_message(record: dict) -> dict:
     key = record.get("key") or {}
     if key.get("fromMe"):
         return {"status": "ignored", "reason": "outbound_message"}
+
+    message_id = key.get("id", "")
+    if not await session_store.mark_message_if_new(message_id):
+        return {"status": "ignored", "reason": "duplicate_message", "message_id": message_id}
 
     incoming_text = extract_whatsapp_text(record.get("message") or {})
     sender_id = key.get("remoteJid", "unknown")
@@ -113,36 +148,40 @@ def process_inbound_whatsapp_message(record: dict) -> dict:
     print(f"📥 [LIVE DATA] Message from {sender_id}: '{incoming_text}'")
 
     analysis = analyze_social_engineering(incoming_text)
-    current_score = 0
-    active_flags = set()
+    delta, msg_flags = score_message_delta(analysis)
 
-    if analysis["urgency_score"] > 0:
-        current_score += (analysis["urgency_score"] * 2)
-        active_flags.add("URGENCY_DETECTED")
-    if analysis["authority_markers"]:
-        current_score += 3
-        active_flags.add("AUTHORITY_CLAIMED")
-    if analysis["action_requests"]:
-        current_score += 5
-        active_flags.add("FINANCIAL_PIVOT")
+    session = await session_store.get_session(sender_id)
+    previous_score = session.risk_score
+    cumulative_score = previous_score + delta
+    active_flags = set(session.flags) | msg_flags
 
-    alert_triggered = current_score >= 8
+    session.risk_score = cumulative_score
+    session.flags = sorted(active_flags)
+    session.message_count += 1
+    session.last_message_preview = incoming_text[:160]
+    await session_store.save_session(session)
+
+    alert_triggered = cumulative_score >= RISK_ALERT_THRESHOLD
     if alert_triggered:
         print(
             f"🚨 [SCAM THREAT TRIGGERED] User: {sender_id} | "
-            f"Total Risk: {current_score} | Active Indicators: {list(active_flags)}"
+            f"Total Risk: {cumulative_score} (+{delta} this msg) | "
+            f"Active Indicators: {session.flags}"
         )
 
-    result = {
+    return {
         "status": "processed",
         "sender": sender_id,
-        "cumulative_risk": current_score,
+        "message_id": message_id,
+        "message_delta": delta,
+        "previous_risk": previous_score,
+        "cumulative_risk": cumulative_score,
+        "message_count": session.message_count,
         "alert": alert_triggered,
-        "active_flags": list(active_flags),
+        "active_flags": session.flags,
         "extracted_indicators": analysis,
         "message_preview": incoming_text[:160],
     }
-    return result
 
 
 async def send_scam_alert_whatsapp(
@@ -247,24 +286,13 @@ async def evaluate_message_stream(payload: InferenceRequest):
         conv_id = payload.session_state.conversation_id if payload.session_state else "anonymous_session"
         current_score = payload.session_state.risk_score if payload.session_state else 0
         active_flags = set(payload.session_state.flags) if payload.session_state else set()
-        
-        # Run linguistic processing
-        analysis = analyze_social_engineering(payload.current_message.text)
-        
-        # State Modification Logic
-        if analysis['urgency_score'] > 0:
-            current_score += (analysis['urgency_score'] * 2)
-            active_flags.add("URGENCY_DETECTED")
-            
-        if analysis['authority_markers']:
-            current_score += 3
-            active_flags.add("AUTHORITY_CLAIMED")
-            
-        if analysis['action_requests']:
-            current_score += 5
-            active_flags.add("FINANCIAL_PIVOT")
 
-        alert_triggered = True if current_score >= 8 else False
+        analysis = analyze_social_engineering(payload.current_message.text)
+        delta, msg_flags = score_message_delta(analysis)
+        current_score += delta
+        active_flags |= msg_flags
+
+        alert_triggered = current_score >= RISK_ALERT_THRESHOLD
 
         return InferenceResponse(
             conversation_id=conv_id,
@@ -292,20 +320,26 @@ async def handle_whatsapp_webhook(request: Request, event_suffix: str = ""):
             return {"status": "ignored", "reason": "non_message_event", "event": event}
 
         instance = body.get("instance", EVOLUTION_INSTANCE)
-        results = [
-            process_inbound_whatsapp_message(record)
-            for record in evolution_message_records(body.get("data"))
-        ]
-        for result in results:
+        results = []
+        for record in evolution_message_records(body.get("data")):
+            result = await process_inbound_whatsapp_message(record)
             if result.get("status") == "processed" and result.get("alert"):
-                alert_meta = await send_scam_alert_whatsapp(
-                    instance=instance,
-                    sender_id=result["sender"],
-                    risk_score=result["cumulative_risk"],
-                    active_flags=result.get("active_flags", []),
-                    message_preview=result.get("message_preview", ""),
-                )
+                if await session_store.try_acquire_alert_cooldown(result["sender"]):
+                    alert_meta = await send_scam_alert_whatsapp(
+                        instance=instance,
+                        sender_id=result["sender"],
+                        risk_score=result["cumulative_risk"],
+                        active_flags=result.get("active_flags", []),
+                        message_preview=result.get("message_preview", ""),
+                    )
+                else:
+                    alert_meta = {
+                        "alert_sent": False,
+                        "reason": "cooldown",
+                        "cooldown_seconds": session_store.ALERT_COOLDOWN_SECONDS,
+                    }
                 result["alert_delivery"] = alert_meta
+            results.append(result)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -334,6 +368,7 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": True if nlp else False,
-        "engine": "Project Aegis Core Inference v1.0"
+        "redis_connected": await session_store.ping(),
+        "engine": "Project Aegis Core Inference v1.0",
     }
     

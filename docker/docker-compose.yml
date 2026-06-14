@@ -10,6 +10,9 @@ services:
     environment:
       - REDIS_HOST=egis-redis
       - REDIS_PORT=6379
+      - REDIS_SESSION_TTL_SECONDS=604800
+      - ALERT_COOLDOWN_SECONDS=300
+      - RISK_ALERT_THRESHOLD=8
       - EVOLUTION_API_URL=http://evolution-api:8080
       - EVOLUTION_API_KEY=AegisSecretKey2026
       - EVOLUTION_INSTANCE=test-user

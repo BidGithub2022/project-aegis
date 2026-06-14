@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt \
     && python -m spacy download en_core_web_sm
 
-COPY app.py .
+COPY app.py session_store.py .
 
 EXPOSE 8000
 
