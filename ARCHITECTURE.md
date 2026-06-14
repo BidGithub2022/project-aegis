@@ -6,13 +6,13 @@ For the longer-term pipeline (Pub/Sub, Beam, BigQuery), see [`flow-diagram`](flo
 
 ## Overview
 
-Project Aegis analyzes **incoming WhatsApp text** for social-engineering / scam patterns. When the risk score reaches **8 or higher**, it sends a **WhatsApp alert** back to the configured owner number through Evolution API.
+Project Aegis analyzes **incoming WhatsApp messages** — text, images, and PDFs — for social-engineering / scam patterns. Risk scores are **cumulative per conversation** (Redis). When the score reaches **8 or higher**, a **WhatsApp alert** is sent to the owner number via Evolution API.
 
 | Layer | Component | Port |
 |-------|-----------|------|
 | Gateway | `evolution-api` | 8080 |
-| Inference | `egis-app` (FastAPI + spaCy) | 8000 |
-| Cache | `egis-redis` | 6379 |
+| Inference | `egis-app` (FastAPI + spaCy + OCR) | 8000 |
+| Session store | `egis-redis` | 6379 |
 | Database | `evolution-postgres` | 5432 (internal) |
 
 Start the stack:
@@ -25,95 +25,144 @@ docker compose up --build
 ## Message flow (live)
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph external [External]
     Sender[External WhatsApp sender]
     WA[WhatsApp network]
-    Phone[Owner phone]
+    Phone[Owner phone 918117945755]
   end
 
   subgraph docker [Docker Compose]
     Evo[evolution-api :8080]
-    Egis[egis-app :8000]
-    Redis[egis-redis :6379]
-    PG[evolution-postgres]
+    subgraph egis [egis-app :8000]
+      WH[Webhook ingest]
+      RES[Resolve content]
+      NLP[spaCy NLP]
+      DOC[Document heuristics]
+      SESS[Session scorer]
+      ALERT[Alert sender]
+    end
+    Redis[(egis-redis :6379)]
+    PG[(evolution-postgres)]
   end
 
-  Sender -->|1 · send text| WA
-  WA -->|2 · inbound message| Evo
-  Evo -->|3 · webhook POST| Egis
-  Egis -->|4 · NLP risk score| Egis
-  Egis -->|5 · sendText alert| Evo
-  Evo -->|6 · WhatsApp push| Phone
+  Sender -->|1 text / image / PDF| WA
+  WA -->|2 inbound| Evo
+  Evo -->|3 webhook POST| WH
+  WH --> RES
+  RES -->|caption / conversation| NLP
+  RES -->|image or PDF| Evo
+  Evo -->|4b getBase64FromMediaMessage| RES
+  RES -->|PyMuPDF + Tesseract OCR| NLP
+  RES --> DOC
+  NLP --> SESS
+  DOC --> SESS
+  SESS <-->|read / write session · dedupe| Redis
+  SESS -->|cumulative score ≥ 8| ALERT
+  ALERT -->|5 sendText| Evo
+  Evo -->|6 WhatsApp push| Phone
   Evo --> PG
   Evo --> Redis
-  Egis -.->|session state planned| Redis
 ```
 
 ### Step detail
 
-1. **External sender** sends a WhatsApp message to the number linked in Evolution (`test-user` instance).
+1. **External sender** sends text, image, or PDF to the linked WhatsApp number (`test-user` instance).
 2. **Evolution API** receives the message (Baileys / WhatsApp Web).
 3. **Webhook** — Evolution POSTs `messages.upsert` to `http://egis-app:8000/v1/webhook/whatsapp`.
-4. **egis-app** runs spaCy NLP, computes a risk score, and sets flags (`URGENCY_DETECTED`, `AUTHORITY_CLAIMED`, `FINANCIAL_PIVOT`).
-5. If **score ≥ 8**, egis-app calls Evolution `POST /message/sendText/{instance}`.
-6. **Owner phone** receives the alert WhatsApp message.
+4. **Content resolution** inside `egis-app`:
+   - Plain text / captions from the webhook payload
+   - For `imageMessage` / `documentMessage` → `POST /chat/getBase64FromMediaMessage/{instance}`
+   - PDF: PyMuPDF text extraction + Tesseract OCR on thin pages
+   - Images: Tesseract OCR
+5. **Analysis** — spaCy NLP + PDF document heuristics (`document_heuristics.py`, ported from cyber-fraud-app).
+6. **Redis session** — load cumulative `risk_score` and `flags` per `remoteJid`; add message delta; dedupe by `message_id`; alert cooldown per sender.
+7. If **cumulative score ≥ 8** and cooldown allows → Evolution `sendText` alert.
+8. **Owner phone** receives the WhatsApp warning.
 
-Outbound messages from the linked phone (`fromMe: true`) are ignored to prevent feedback loops.
+Outbound messages from the linked phone (`fromMe: true`) are ignored.
+
+## egis-app modules
+
+| Module | Responsibility |
+|--------|----------------|
+| `app.py` | FastAPI routes, webhook orchestration, scoring glue |
+| `session_store.py` | Redis sessions, message dedupe, alert cooldown |
+| `evolution_client.py` | Fetch media base64 from Evolution API |
+| `media_extractor.py` | PDF parse, image OCR (PyMuPDF + Tesseract) |
+| `document_heuristics.py` | Fake-official PDF pattern detection |
+
+### API endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/webhook/whatsapp` | Evolution webhook ingestor |
+| `POST` | `/v1/analyze` | Direct NLP API (client-provided session) |
+| `POST` | `/v1/scan-document` | Upload PDF/image for local testing |
+| `GET` | `/healthz` | Health probe (`redis_connected`, model loaded) |
+
+### Key environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `EVOLUTION_API_URL` | `http://evolution-api:8080` (internal) |
+| `EVOLUTION_API_KEY` | Evolution auth key |
+| `EVOLUTION_INSTANCE` | e.g. `test-user` |
+| `EVOLUTION_ALERT_NUMBER` | Alert recipient (digits, no `+`) |
+| `REDIS_HOST` / `REDIS_PORT` | Session store |
+| `REDIS_SESSION_TTL_SECONDS` | Conversation TTL (default 7 days) |
+| `ALERT_COOLDOWN_SECONDS` | Min gap between alerts per sender (default 300) |
+| `RISK_ALERT_THRESHOLD` | Default `8` |
+| `MAX_MEDIA_BYTES` | Max download size (default 8 MB) |
 
 ## Services (`docker/docker-compose.yml`)
 
 ### egis-app
 
-- **Image:** built from `docker/dockerfile` (repo root context).
-- **Endpoints:**
-  - `POST /v1/webhook/whatsapp` — Evolution webhook ingestor
-  - `POST /v1/analyze` — direct NLP API for testing
-  - `GET /healthz` — liveness / readiness probe
-- **Env (alerts):**
-  - `EVOLUTION_API_URL` — `http://evolution-api:8080` inside Compose
-  - `EVOLUTION_API_KEY` — matches Evolution `AUTHENTICATION_API_KEY`
-  - `EVOLUTION_INSTANCE` — e.g. `test-user`
-  - `EVOLUTION_ALERT_NUMBER` — e.g. `918117945755` (digits, no `+`)
-  - `EVOLUTION_ALERTS_ENABLED` — `true` / `false`
+Built from `docker/dockerfile` with **Tesseract**, **PyMuPDF**, **spaCy**, **Redis client**.
 
 ### evolution-api
 
-- **Image:** `evoapicloud/evolution-api:latest`
-- **Webhook:** `WEBHOOK_GLOBAL_URL=http://egis-app:8000/v1/webhook/whatsapp`
-- **Events:** `WEBHOOK_EVENTS_MESSAGES_UPSERT=true`
-- Persists instances and metadata in PostgreSQL; uses Redis for cache.
+- Image: `evoapicloud/evolution-api:latest`
+- Webhook: `WEBHOOK_GLOBAL_URL=http://egis-app:8000/v1/webhook/whatsapp`
+- Media API used by egis: `POST /chat/getBase64FromMediaMessage/{instance}`
 
 ### egis-redis
 
-- Shared Redis for Evolution cache.
-- Session / risk history for egis-app is **planned** (env vars exist; not fully wired in `app.py`).
+- Evolution API cache (`CACHE_REDIS_URI`)
+- **Aegis conversation sessions** (`aegis:session:{remoteJid}`)
+- Message dedupe keys (`aegis:msg:{messageId}`)
+- Alert cooldown keys (`aegis:alert_cooldown:{remoteJid}`)
 
 ### evolution-postgres
 
-- Required for Evolution API v2.
-- Database: `evolution_db`, schema: `evolution_api`.
+Evolution API v2 persistence (`evolution_db`).
 
 ## Risk scoring (summary)
+
+Scores are **cumulative** per conversation (stored in Redis).
 
 | Signal | Detection | Points |
 |--------|-----------|--------|
 | Urgency | `now`, `immediately`, `urgent`, `minutes`, `seconds`, `last chance` | +2 per word |
 | Authority | spaCy NER (`ORG`, `PERSON`, `GPE`) | +3 if any |
 | Money / action | `transfer`, `pay`, `send`, `wire`, `buy`, `gift card`, `crypto` | +5 if any |
+| Document heuristics | Fake official PDF patterns (govt + payment, metadata, filename) | +3 per trigger (max +9) |
 
-**Alert:** cumulative score **≥ 8**.
+**Alert:** cumulative score **≥ 8** (configurable).
 
-Example that triggers: `Wire transfer $500 immediately now urgent last chance`.
+**Example multi-message scam:** message 1 benign → message 2 “wire transfer” (+5) → message 3 “urgent now” (+6) → cumulative 11 → alert.
 
 ## What is scanned today
 
 | Input | Status |
 |-------|--------|
 | Incoming WhatsApp **text** | Active |
-| Image / PDF / voice (no extractable text) | Ignored (`non_text_message`) |
+| WhatsApp **image** (OCR) | Active |
+| WhatsApp **PDF** (text + OCR + heuristics) | Active |
+| Image/PDF **caption** | Merged with extracted text |
+| Video / audio / stickers (no text) | Ignored or `media_extract_failed` |
 | Outbound from linked phone | Ignored (`fromMe`) |
-| PDF / document pipeline | Not implemented in this repo |
 
 ## Testing
 
@@ -121,17 +170,16 @@ Example that triggers: `Wire transfer $500 immediately now urgent last chance`.
 
 ```bash
 curl http://localhost:8000/healthz
-curl -H "apikey: AegisSecretKey2026" http://localhost:8080/
 ```
 
-**Instance status:**
+**Upload PDF/image (no WhatsApp):**
 
 ```bash
-curl -H "apikey: AegisSecretKey2026" \
-  http://localhost:8080/instance/connectionState/test-user
+curl -X POST http://localhost:8000/v1/scan-document \
+  -F "file=@/path/to/notice.pdf"
 ```
 
-**Simulate webhook (no WhatsApp):**
+**Simulate text webhook:**
 
 ```bash
 curl -X POST http://localhost:8000/v1/webhook/whatsapp \
@@ -146,19 +194,27 @@ curl -X POST http://localhost:8000/v1/webhook/whatsapp \
   }'
 ```
 
-**Real WhatsApp test:** another phone sends a scam-like message to your linked number; watch `docker compose logs -f egis-app`.
+**Cumulative session test:** send multiple webhooks with the same `remoteJid` and different `id` values; watch `previous_risk` and `cumulative_risk` increase.
+
+**Inspect Redis session:**
+
+```bash
+docker exec egis-state-cache redis-cli GET "aegis:session:919999999999@s.whatsapp.net"
+```
+
+**Real WhatsApp:** send text, PDF, or image from another phone; watch `docker compose logs -f egis-app`.
 
 ## Future / not built
 
 From [`flow-diagram`](flow-diagram):
 
-- Message queue (Pub/Sub)
+- Async message queue (Pub/Sub) — OCR still runs inline in webhook today
 - Apache Beam stream processing
-- Redis session history in the inference path
 - BigQuery warehouse and model retraining
-- Outbound alert routing beyond a single `sendText`
+- MCP tool layer / agentic triage
+- Selective LLM pass for gray-zone messages
 
-Optional integrations:
+Optional:
 
-- **cyber-fraud-app** — Socket.IO chat + PDF scan (separate repo; not wired into this stack)
-- **OpenShift** — `openshift/deployment.yaml` targets egis-app; Evolution and Postgres would be separate cluster deployments in production
+- **cyber-fraud-app** — separate demo chat; heuristics partially ported into `document_heuristics.py`
+- **OpenShift** — `openshift/deployment.yaml` targets egis-app; Redis/Evolution are separate cluster services in production
