@@ -1,0 +1,71 @@
+services:
+  # 1. Your Custom NLP Inference Engine
+  egis-app:
+    build:
+      context: ..
+      dockerfile: docker/dockerfile
+    container_name: egis-inference-engine
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=egis-redis
+      - REDIS_PORT=6379
+      - EVOLUTION_API_URL=http://evolution-api:8080
+      - EVOLUTION_API_KEY=AegisSecretKey2026
+      - EVOLUTION_INSTANCE=test-user
+      - EVOLUTION_ALERT_NUMBER=918117945755
+      - EVOLUTION_ALERTS_ENABLED=true
+    volumes:
+      - ..:/app # Hot-reloads your local app.py changes instantly without rebuilding
+    depends_on:
+      - egis-redis
+
+  # 2. The Evolution API Gateway (official image: evoapicloud/evolution-api)
+  evolution-api:
+    image: evoapicloud/evolution-api:latest
+    container_name: evolution-api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - AUTHENTICATION_API_KEY=AegisSecretKey2026
+      - SERVER_URL=http://localhost:8080
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://evolution:AegisSecretKey2026@evolution-postgres:5432/evolution_db?schema=evolution_api
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://egis-redis:6379
+      - WEBHOOK_GLOBAL_ENABLED=true
+      # Inside Docker Compose, containers talk to each other using their service names!
+      - WEBHOOK_GLOBAL_URL=http://egis-app:8000/v1/webhook/whatsapp
+      - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+    volumes:
+      - evolution_instances:/evolution/instances
+    depends_on:
+      - egis-app
+      - egis-redis
+      - evolution-postgres
+
+  # 3. State Memory Cache (Redis) — shared by egis-app and evolution-api
+  egis-redis:
+    image: redis:7-alpine
+    container_name: egis-state-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # 4. Evolution API database (required for v2)
+  evolution-postgres:
+    image: postgres:15-alpine
+    container_name: evolution-postgres
+    environment:
+      POSTGRES_DB: evolution_db
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: AegisSecretKey2026
+    volumes:
+      - evolution_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  evolution_instances:
+  evolution_postgres_data:
+  redis_data:
