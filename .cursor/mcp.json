@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "project-aegis": {
+      "command": "/Users/bidyut/project-aegis/.venv-mcp/bin/python",
+      "args": ["/Users/bidyut/project-aegis/mcp_server.py"],
+      "env": {
+        "EGIS_API_URL": "http://localhost:8000"
+      }
+    }
+  }
+}

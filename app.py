@@ -10,6 +10,8 @@ from pydantic import BaseModel
 
 import evolution_client
 import session_store
+import agent_config
+from agent_config import AGENT_ENABLED, is_gray_zone
 from media_extractor import extract_text_from_media_async
 
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://evolution-api:8080").rstrip("/")
@@ -61,6 +63,17 @@ class InferenceResponse(BaseModel):
     updated_risk_score: int
     active_flags: List[str]
     alert_triggered: bool
+
+
+class AgentVerdictRequest(BaseModel):
+    job_id: str
+    conversation_id: str
+    instance: str = EVOLUTION_INSTANCE
+    verdict: str  # escalate | benign | monitor
+    reason: str = ""
+    risk_score: int = 0
+    message_preview: str = ""
+    active_flags: List[str] = []
 
 
 # --- Inbound Evolution API (WhatsApp) Webhook Schemas ---
@@ -267,9 +280,41 @@ async def process_inbound_whatsapp_message(record: dict, instance: str) -> dict:
     session.flags = sorted(active_flags)
     session.message_count += 1
     session.last_message_preview = message_preview
+    session_store.append_message_history(session, message_preview, delta, sorted(msg_flags))
     await session_store.save_session(session)
 
     alert_triggered = cumulative_score >= RISK_ALERT_THRESHOLD
+    agent_queued = False
+    if (
+        AGENT_ENABLED
+        and is_gray_zone(cumulative_score)
+        and not alert_triggered
+    ):
+        job = {
+            "job_id": message_id or f"{sender_id}:{session.message_count}",
+            "conversation_id": sender_id,
+            "message_id": message_id,
+            "instance": instance,
+            "cumulative_risk": cumulative_score,
+            "message_delta": delta,
+            "previous_risk": previous_score,
+            "active_flags": session.flags,
+            "message_preview": message_preview,
+            "extracted_indicators": analysis,
+            "document_signals": {
+                "triggers": extraction.get("document_triggers", []),
+                "reasons": extraction.get("document_reasons", []),
+                "used_ocr": extraction.get("used_ocr", False),
+            },
+            "source_kind": source_kind,
+        }
+        agent_queued = await session_store.enqueue_agent_job(job)
+        if agent_queued:
+            print(
+                f"🤖 [AGENT QUEUED] Gray zone review for {sender_id} "
+                f"(risk={cumulative_score})"
+            )
+
     if alert_triggered:
         print(
             f"🚨 [SCAM THREAT TRIGGERED] User: {sender_id} | "
@@ -287,6 +332,7 @@ async def process_inbound_whatsapp_message(record: dict, instance: str) -> dict:
         "cumulative_risk": cumulative_score,
         "message_count": session.message_count,
         "alert": alert_triggered,
+        "agent_queued": agent_queued,
         "active_flags": session.flags,
         "extracted_indicators": analysis,
         "document_signals": {
@@ -518,6 +564,111 @@ async def scan_document_upload(file: UploadFile = File(...)):
 # ==========================================
 # 4. CLUSTER OPERATIONS MANAGEMENT (HEALTH)
 # ==========================================
+
+@app.get("/v1/session/{conversation_id}", status_code=status.HTTP_200_OK)
+async def get_conversation_session(conversation_id: str):
+    """Read-only session lookup for ops / MCP. Does not change webhook behavior."""
+    session = await session_store.get_session(conversation_id)
+    return session.to_dict()
+
+
+@app.get("/v1/sessions", status_code=status.HTTP_200_OK)
+async def list_conversation_sessions(min_risk: int = 0, limit: int = 50):
+    """Read-only session listing for ops / MCP."""
+    limit = max(1, min(limit, 200))
+    sessions = await session_store.list_sessions(min_risk=min_risk, limit=limit)
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+def _verify_agent_token(request: Request) -> None:
+    if not agent_config.AGENT_INTERNAL_TOKEN:
+        return
+    token = request.headers.get("X-Agent-Token", "")
+    if token != agent_config.AGENT_INTERNAL_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid_agent_token",
+        )
+
+
+@app.post("/v1/agent/verdict", status_code=status.HTTP_200_OK)
+async def apply_agent_verdict(payload: AgentVerdictRequest, request: Request):
+    """Apply Cursor agent verdict (called by agent_worker)."""
+    _verify_agent_token(request)
+
+    verdict = payload.verdict.strip().lower()
+    if verdict not in ("escalate", "benign", "monitor"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_verdict",
+        )
+
+    session = await session_store.get_session(payload.conversation_id)
+    session.agent_verdict = verdict
+    session.agent_reason = payload.reason[:500]
+    if verdict == "benign":
+        session.risk_score = min(session.risk_score, agent_config.GRAY_ZONE_MIN - 1)
+        session.flags = [f for f in session.flags if f != "AGENT_ESCALATED"]
+    elif verdict == "escalate":
+        if "AGENT_ESCALATED" not in session.flags:
+            session.flags.append("AGENT_ESCALATED")
+    await session_store.save_session(session)
+    await session_store.clear_agent_pending(payload.conversation_id)
+
+    alert_delivery: dict = {"alert_sent": False, "reason": "not_escalate"}
+    if verdict == "escalate":
+        if await session_store.try_acquire_alert_cooldown(payload.conversation_id):
+            alert_delivery = await send_scam_alert_whatsapp(
+                instance=payload.instance,
+                sender_id=payload.conversation_id,
+                risk_score=payload.risk_score or session.risk_score,
+                active_flags=payload.active_flags or session.flags,
+                message_preview=payload.message_preview or session.last_message_preview,
+            )
+        else:
+            alert_delivery = {
+                "alert_sent": False,
+                "reason": "cooldown",
+                "cooldown_seconds": session_store.ALERT_COOLDOWN_SECONDS,
+            }
+
+    case = {
+        "job_id": payload.job_id,
+        "conversation_id": payload.conversation_id,
+        "verdict": verdict,
+        "reason": payload.reason,
+        "alert_delivery": alert_delivery,
+    }
+    await session_store.save_agent_case(payload.job_id, case)
+
+    return {
+        "status": "applied",
+        "verdict": verdict,
+        "session": session.to_dict(),
+        "alert_delivery": alert_delivery,
+    }
+
+
+@app.get("/v1/agent/case/{job_id}", status_code=status.HTTP_200_OK)
+async def get_agent_case(job_id: str):
+    """Read agent verdict for a gray-zone job."""
+    case = await session_store.get_agent_case(job_id)
+    if not case:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="case_not_found")
+    return case
+
+
+@app.get("/v1/agent/status", status_code=status.HTTP_200_OK)
+async def agent_status():
+    """Agent pipeline status for ops."""
+    return {
+        "agent_enabled": AGENT_ENABLED,
+        "gray_zone_min": agent_config.GRAY_ZONE_MIN,
+        "gray_zone_max": agent_config.GRAY_ZONE_MAX,
+        "queue_length": await session_store.agent_queue_length(),
+        "risk_alert_threshold": RISK_ALERT_THRESHOLD,
+    }
+
 
 @app.get("/healthz", status_code=status.HTTP_200_OK)
 async def health_check():

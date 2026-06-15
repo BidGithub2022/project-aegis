@@ -1,0 +1,7 @@
+# Agent worker — install into .venv-mcp (or a dedicated venv):
+#   .venv-mcp/bin/pip install -r requirements-agent.txt
+
+-r requirements-mcp.txt
+cursor-sdk>=0.1.7,<1.0
+redis>=5.0,<9.0
+python-dotenv>=1.0,<2.0

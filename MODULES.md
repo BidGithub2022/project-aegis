@@ -2,7 +2,7 @@
 
 How the `.py` files connect in the **live Docker stack** (`uvicorn app:app`).
 
-For deployment topology, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For the long-term pipeline, see [`flow-diagram`](flow-diagram).
+For deployment topology, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For the long-term pipeline, see [`flow-diagram`](flow-diagram). For optional MCP (Solution 2), see [`MCP.md`](MCP.md).
 
 ## Import graph
 

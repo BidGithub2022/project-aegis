@@ -13,6 +13,9 @@ services:
       - REDIS_SESSION_TTL_SECONDS=604800
       - ALERT_COOLDOWN_SECONDS=300
       - RISK_ALERT_THRESHOLD=8
+      - AGENT_ENABLED=true
+      - GRAY_ZONE_MIN=4
+      - GRAY_ZONE_MAX=7
       - EVOLUTION_API_URL=http://evolution-api:8080
       - EVOLUTION_API_KEY=AegisSecretKey2026
       - EVOLUTION_INSTANCE=test-user
@@ -22,6 +25,28 @@ services:
       - ..:/app # Hot-reloads your local app.py changes instantly without rebuilding
     depends_on:
       - egis-redis
+
+  # 5. Gray-zone agent worker (Cursor SDK + MCP) — auto-starts with compose
+  egis-agent:
+    build:
+      context: ..
+      dockerfile: docker/agent.dockerfile
+    container_name: egis-agent-worker
+    env_file:
+      - ../.env
+    environment:
+      - REDIS_HOST=egis-redis
+      - EGIS_API_URL=http://egis-app:8000
+      - MCP_PYTHON=/usr/local/bin/python
+      - MCP_SERVER=/app/mcp_server.py
+    volumes:
+      - ../agent_worker.py:/app/agent_worker.py
+      - ../agent_config.py:/app/agent_config.py
+      - ../mcp_server.py:/app/mcp_server.py
+    depends_on:
+      - egis-app
+      - egis-redis
+    restart: unless-stopped
 
   # 2. The Evolution API Gateway (official image: evoapicloud/evolution-api)
   evolution-api:
